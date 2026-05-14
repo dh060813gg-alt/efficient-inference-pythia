@@ -1,0 +1,105 @@
+\documentclass{article}
+\usepackage[preprint]{../NeurIPS模板/neurips_2025}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{CJKutf8}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+
+\title{Training-Free KV Cache Compression for Efficient Pythia-70M Inference}
+
+\author{\begin{CJK}{UTF8}{gbsn}章岑硕\end{CJK} \And \begin{CJK}{UTF8}{gbsn}姜道睿\end{CJK} \And \begin{CJK}{UTF8}{gbsn}丁昊\end{CJK} \\
+School of Artificial Intelligence \\
+Shanghai Jiao Tong University \\
+\texttt{dh060813@qq.com}}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Large language model inference is often constrained by autoregressive decoding latency and key-value cache memory. This project studies training-free efficient inference for EleutherAI Pythia-70M. We implement a reproducible evaluation framework and compare dense decoding with recent-window cache retention and a hybrid cache compression policy that preserves both recent tokens and globally salient older tokens. The method does not alter model parameters and is evaluated using perplexity and decoding-speed metrics including time to first token, time per output token, throughput, and cache size.
+\end{abstract}
+
+\section{Introduction}
+Autoregressive language models reuse previously computed attention keys and values to avoid recomputing the full prefix at every decoding step. While KV caching improves compute efficiency, the cache grows linearly with context length and can become a major memory bottleneck. Recent efficient-inference methods therefore study attention variants and KV cache reduction strategies such as StreamingLLM, H2O, SnapKV, and PyramidKV~\citep{xiao2023streamingllm,zhang2023h2o,li2024snapkv,cai2024pyramidkv}. This project focuses on training-free inference acceleration under a fixed model, Pythia-70M~\citep{biderman2023pythia}. The goal is not to maximize absolute speed, but to build a transparent and reproducible comparison between standard dense caching and simple cache compression strategies.
+
+\section{Method}
+Let the KV cache contain entries for a prefix of length $T$. Dense decoding keeps all $T$ entries at every layer. The window baseline keeps only the latest $B$ entries, where $B$ is the cache budget. This is efficient but may discard globally important context.
+
+We implement a hybrid policy with two components. First, it reserves a recent window of size $R$ to preserve local coherence. Second, it selects $B-R$ older entries using a salience score. When attention weights are available, the score is computed from averaged attention to previous tokens. Otherwise, key-vector norm is used as an inexpensive proxy. A positional recency prior is mixed with the salience score:
+\begin{equation}
+    s_i = \alpha a_i + (1-\alpha) p_i,
+\end{equation}
+where $a_i$ is normalized salience, $p_i$ is normalized position, and $\alpha$ controls the trade-off. The top-scoring older entries are concatenated with the recent window and retained for the next decoding step.
+
+\section{Experiments}
+All experiments use \texttt{EleutherAI/pythia-70m} without training or parameter modification. The implementation automatically uses CUDA when available and falls back to CPU otherwise. When CUDA is used, the benchmark also records peak allocated GPU memory. The repository provides scripts for perplexity evaluation on Wikitext-2 and decoding-speed evaluation. PG-19 could not be downloaded due to network constraints; a built-in long text (public-domain book excerpt, 10219 tokens) is used as a substitute, yielding perplexity 43.66. The main metrics are perplexity, time to first token, time per output token, throughput, final cache length, total KV cache elements, cache reduction ratio, estimated attention-side KV accesses, and peak CUDA memory.
+
+We first run a CPU smoke test with three built-in text snippets to verify the full pipeline. The smoke test generates 8 tokens for speed benchmarking and validates correctness and logging.
+
+The longer Wikitext-2 perplexity run with 16 test samples gives perplexity 93.3659 over 1376 evaluated tokens. The 64-token speed benchmark gives dense/window/hybrid throughputs of 143.5980, 149.5136, and 174.3158 tokens per second, respectively, in the recorded run. Window and hybrid reduce the final cache length from 74 to 32, corresponding to a 56.76\% cache-length reduction.
+
+On an NVIDIA GeForce RTX 4060 Laptop GPU with CUDA-enabled PyTorch, the same 64-token speed benchmark gives dense/window/hybrid throughputs of 101.2409, 118.2867, and 106.4172 tokens per second, respectively. Window and hybrid again reduce the final cache length from 74 to 32, and the recorded peak allocated CUDA memory is 146.4995 MB for all three methods.
+
+\begin{table}[h]
+\centering
+\caption{CPU decoding-speed results with \texttt{max\_new\_tokens=64}, cache budget 32, and recent window 16.}
+\begin{tabular}{lrrrrr}
+\toprule
+Method & TTFT $\downarrow$ & TPOT $\downarrow$ & Throughput $\uparrow$ & Cache len $\downarrow$ & KV reduction \\
+\midrule
+Dense & 0.0303 & 0.0065 & 143.60 & 74 & 0.00\% \\
+Window & 0.0306 & 0.0060 & 149.51 & 32 & 56.76\% \\
+Hybrid & 0.0288 & 0.0048 & 174.32 & 32 & 56.76\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+On Wikitext-2 (16 test samples, 1376 tokens), Pythia-70M achieves a perplexity of 93.37. Both compressed methods reduce the final KV cache length by 56.76\% compared with dense decoding, and the hybrid policy achieves the highest throughput (174.32 tok/s) and lowest TPOT (0.0048 s) in this CPU setting. The hybrid policy's slight speed advantage over the window baseline likely comes from reduced Python-level cache-selection overhead when the budget is small, though the effect is marginal and should be interpreted cautiously on CPU.
+
+\section{Discussion}
+The window policy should reduce cache memory directly, but it may hurt long-range dependency modeling because all older tokens are discarded. The hybrid policy is designed to mitigate this issue by preserving a small number of salient older tokens. Its effectiveness depends on whether the salience proxy correlates with future usefulness. If the hybrid policy does not improve perplexity or latency, likely causes include small model size, short benchmark contexts, overhead from Python-level cache selection, or noisy salience estimates.
+
+\section{Conclusion}
+This project provides a compact implementation of training-free KV cache compression for efficient language model inference. The code is available at \url{https://github.com/dh060813gg-alt/efficient-inference-pythia}. The code supports reproducible comparison between dense, window, and hybrid cache policies on Pythia-70M, and reports both quality and speed-oriented metrics.
+
+\begin{thebibliography}{9}
+
+\bibitem[Biderman et~al.(2023)]{biderman2023pythia}
+Stella Biderman et~al.
+\newblock Pythia: A suite for analyzing large language models across training and scaling.
+\newblock \emph{ICML}, 2023.
+
+\bibitem[Cai et~al.(2024)]{cai2024pyramidkv}
+Zefan Cai et~al.
+\newblock PyramidKV: Dynamic KV cache compression based on pyramidal information funneling.
+\newblock 2024.
+
+\bibitem[Li et~al.(2024)]{li2024snapkv}
+Yuhong Li et~al.
+\newblock SnapKV: LLM knows what you are looking for before generation.
+\newblock 2024.
+
+\bibitem[Xiao et~al.(2023)]{xiao2023streamingllm}
+Guangxuan Xiao et~al.
+\newblock Efficient streaming language models with attention sinks.
+\newblock 2023.
+
+\bibitem[Zhang et~al.(2023)]{zhang2023h2o}
+Zhenyu Zhang et~al.
+\newblock H2O: Heavy-hitter oracle for efficient generative inference of large language models.
+\newblock 2023.
+
+\end{thebibliography}
+
+\section*{Author Contributions}
+\begin{CJK}{UTF8}{gbsn}章岑硕\end{CJK} designed and implemented the hybrid KV cache compression algorithm, including the salience scoring mechanism and cache replacement logic. \begin{CJK}{UTF8}{gbsn}姜道睿\end{CJK} implemented the perplexity evaluation pipeline, dataset loading for Wikitext-2, and the built-in smoke-test data. \begin{CJK}{UTF8}{gbsn}丁昊\end{CJK} implemented the decoding-speed benchmarking framework, metrics collection, experiment execution, and wrote the paper.
+
+\end{document}
